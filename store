@@ -1,0 +1,293 @@
+/* ============================================================
+   RK STORE – script.js
+   ============================================================ */
+ 
+/* ---------- 1. CONFIGURATION (edit only this section) ---------- */
+ 
+// Paste your product list link here. Supported:
+//  • JSON URL / API returning an array of products (or {products:[...]})
+//  • Google Sheet published as CSV (File > Share > Publish to web > CSV)
+// Leave as is to see the 8 SAMPLE products (prices are placeholders).
+const PRODUCT_SOURCE_URL = "PASTE_PRODUCT_LIST_LINK_HERE";
+ 
+const STORE_SETTINGS = {
+  deliveryCharge: 20,      // charged when below freeDeliveryAbove
+  freeDeliveryAbove: 200,  // delivery FREE when subtotal is above this
+  minimumOrder: 5,         // checkout blocked below this subtotal
+  upiId: ""                // optional, e.g. "rkstore@upi" – shown to customer
+};
+ 
+// Get these 3 values from emailjs.com (see README notes in chat).
+const EMAIL_CONFIG = {
+  serviceId: "YOUR_EMAILJS_SERVICE_ID",   // e.g. service_abc123
+  templateId: "YOUR_EMAILJS_TEMPLATE_ID", // e.g. template_xyz789
+  publicKey: "YOUR_EMAILJS_PUBLIC_KEY",   // Account > General > Public Key
+  ownerEmail: "r57660759@gmail.com"
+};
+ 
+// Sample products – used ONLY when PRODUCT_SOURCE_URL is not set.
+const SAMPLE_PRODUCTS = [
+  {id:1,name:"Colgate Toothpaste",category:"Personal Care",brand:"Colgate",price:55,mrp:60,unit:"100g",image:"https://i.ibb.co/m7Yx9Ns/colgate.jpg",stock:true},
+  {id:2,name:"Marie Biscuits",category:"Snacks",brand:"Britannia",price:30,mrp:35,unit:"250g",image:"https://i.ibb.co/MxyXBFS8/Marie.jpg",stock:true},
+  {id:3,name:"Sting Energy Drink",category:"Drinks",brand:"Sting",price:20,mrp:20,unit:"250ml",image:"https://i.ibb.co/wh1kYhGm/Sting.jpg",stock:true},
+  {id:4,name:"Vim Dishwash",category:"Household",brand:"Vim",price:10,mrp:12,unit:"90g",image:"https://i.ibb.co/WWHd4ykM/vim.jpg",stock:true},
+  {id:5,name:"Potato (Alu)",category:"Grocery",brand:"",price:30,mrp:35,unit:"1kg",image:"https://i.ibb.co/1f950TpC/alu.jpg",stock:true},
+  {id:6,name:"Onion (Piyaj)",category:"Grocery",brand:"",price:40,mrp:45,unit:"1kg",image:"https://i.ibb.co/wrwYdgyH/piyaj.jpg",stock:true},
+  {id:7,name:"Wheat Atta",category:"Grocery",brand:"",price:260,mrp:280,unit:"5kg",image:"https://i.ibb.co/XxHhYPvk/atta.jpg",stock:true},
+  {id:8,name:"Coconut Oil",category:"Grocery",brand:"",price:90,mrp:100,unit:"500ml",image:"https://i.ibb.co/3mqr60dD/oil-coconut.jpg",stock:true}
+];
+ 
+const CATEGORIES = ["All","Grocery","Snacks","Drinks","Personal Care","Household","Stationery","Other"];
+ 
+/* ---------- 2. STATE & HELPERS ---------- */
+const $ = id => document.getElementById(id);
+let products = [], cart = {}, activeCat = "All", query = "";
+const money = n => "₹" + (Math.round(n * 100) / 100);
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const find = id => products.find(p => String(p.id) === String(id));
+const PLACEHOLDER = "data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='200' height='200'><rect width='200' height='200' fill='%23eee'/><text x='100' y='108' text-anchor='middle' fill='%23999' font-size='16'>No image</text></svg>";
+ 
+try { cart = JSON.parse(localStorage.getItem("rkCart")) || {}; } catch (e) { cart = {}; }
+const saveCart = () => localStorage.setItem("rkCart", JSON.stringify(cart));
+ 
+/* ---------- 3. PRODUCT LOADING ---------- */
+function parseCSV(text) {
+  const rows = []; let row = [], cur = "", q = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (q) { if (c === '"' && text[i+1] === '"') { cur += '"'; i++; } else if (c === '"') q = false; else cur += c; }
+    else if (c === '"') q = true;
+    else if (c === ",") { row.push(cur); cur = ""; }
+    else if (c === "\n" || c === "\r") { if (c === "\r" && text[i+1] === "\n") i++; row.push(cur); rows.push(row); row = []; cur = ""; }
+    else cur += c;
+  }
+  if (cur || row.length) { row.push(cur); rows.push(row); }
+  const head = rows.shift().map(h => h.trim().toLowerCase());
+  return rows.filter(r => r.some(x => x.trim())).map(r => Object.fromEntries(head.map((h, i) => [h, (r[i] || "").trim()])));
+}
+ 
+// Normalises any source row into the standard product shape.
+function normalise(p, i) {
+  const stockVal = String(p.stock ?? "true").toLowerCase();
+  const price = Number(p.price) || 0;
+  return {
+    id: p.id || i + 1, name: p.name || "Unnamed product", category: p.category || "Other",
+    brand: p.brand || "", price, mrp: Number(p.mrp) || price, unit: p.unit || "",
+    image: p.image || "", keywords: p.keywords || "",
+    stock: !["false", "no", "0", "out", "out of stock"].includes(stockVal)
+  };
+}
+ 
+async function loadProductsFromURL() {
+  if (!PRODUCT_SOURCE_URL || PRODUCT_SOURCE_URL.startsWith("PASTE_")) {
+    $("status").textContent = "Showing sample products. Set PRODUCT_SOURCE_URL in script.js to load your list.";
+    return SAMPLE_PRODUCTS.map(normalise);
+  }
+  const res = await fetch(PRODUCT_SOURCE_URL);
+  if (!res.ok) throw new Error("HTTP " + res.status);
+  const text = await res.text();
+  let data;
+  try { data = JSON.parse(text); if (!Array.isArray(data)) data = data.products || []; }
+  catch (e) { data = parseCSV(text); }      // not JSON → treat as CSV (Google Sheet)
+  return data.map(normalise);
+}
+ 
+/* ---------- 4. RENDERING ---------- */
+function renderCats() {
+  $("cats").innerHTML = CATEGORIES.map(c => `<button class="${c === activeCat ? "on" : ""}" data-cat="${c}">${c}</button>`).join("");
+}
+ 
+function renderProducts() {
+  const q = query.trim().toLowerCase();
+  const list = products.filter(p =>
+    (activeCat === "All" || p.category.toLowerCase() === activeCat.toLowerCase() ||
+      (activeCat === "Other" && !CATEGORIES.some(c => c.toLowerCase() === p.category.toLowerCase()))) &&
+    (!q || [p.name, p.brand, p.category, p.keywords].join(" ").toLowerCase().includes(q)));
+  $("grid").innerHTML = list.map(p => {
+    const off = p.mrp > p.price ? Math.round((p.mrp - p.price) / p.mrp * 100) : 0;
+    return `<article class="card">
+      ${off ? `<span class="badge">${off}% OFF</span>` : ""}
+      <img src="${esc(p.image) || PLACEHOLDER}" alt="${esc(p.name)}" loading="lazy" onerror="this.onerror=null;this.src=PLACEHOLDER">
+      <h3>${esc(p.name)}</h3>
+      <div class="meta">${esc(p.brand)}${p.brand && p.unit ? " · " : ""}${esc(p.unit)}</div>
+      <div class="row"><div class="price"><b>${money(p.price)}</b>${off ? `<s>${money(p.mrp)}</s>` : ""}</div>
+      ${!p.stock ? `<span class="oos">Out of stock</span>` : cart[p.id] ? qtyHTML(p.id) : `<button class="add" data-add="${esc(p.id)}">ADD</button>`}</div>
+    </article>`;
+  }).join("") || `<p class="empty">No products found.</p>`;
+}
+ 
+const qtyHTML = id => `<div class="qty"><button data-dec="${esc(id)}" aria-label="Decrease">−</button><span>${cart[id]}</span><button data-inc="${esc(id)}" aria-label="Increase">+</button></div>`;
+ 
+/* ---------- 5. CART LOGIC ---------- */
+function totals() {
+  let subtotal = 0, mrpTotal = 0;
+  for (const id in cart) { const p = find(id); if (p) { subtotal += p.price * cart[id]; mrpTotal += p.mrp * cart[id]; } }
+  const empty = subtotal === 0;
+  const delivery = empty ? 0 : subtotal > STORE_SETTINGS.freeDeliveryAbove ? 0 : STORE_SETTINGS.deliveryCharge;
+  return { subtotal, discount: mrpTotal - subtotal, delivery, total: subtotal + delivery, empty };
+}
+ 
+function billHTML(t) {
+  return `<div><span>Subtotal</span><span>${money(t.subtotal)}</span></div>
+    <div><span>Discount (savings)</span><span>${money(t.discount)}</span></div>
+    <div><span>Delivery charge</span><span>${t.delivery ? money(t.delivery) : '<span class="free">FREE</span>'}</span></div>
+    <div class="tot"><span>Final total</span><span>${money(t.total)}</span></div>`;
+}
+ 
+function change(id, d) {
+  const n = (cart[id] || 0) + d;
+  if (n <= 0) delete cart[id]; else cart[id] = n;
+  update();
+}
+ 
+function update() {
+  // drop items no longer in the product list
+  for (const id in cart) if (!find(id)) delete cart[id];
+  saveCart();
+  $("cartCount").textContent = Object.values(cart).reduce((a, b) => a + b, 0);
+  renderProducts(); renderCart();
+}
+ 
+function renderCart() {
+  const t = totals(), ids = Object.keys(cart);
+  $("cartItems").innerHTML = ids.length ? ids.map(id => { const p = find(id); return `<div class="ci">
+      <img src="${esc(p.image) || PLACEHOLDER}" alt="" onerror="this.onerror=null;this.src=PLACEHOLDER">
+      <div><b>${esc(p.name)}</b><div class="meta">${esc(p.unit)} · ${money(p.price)}</div><button class="rm" data-rm="${esc(id)}">Remove</button></div>
+      <div><div class="qty"><button data-dec="${esc(id)}" aria-label="Decrease">−</button><span>${cart[id]}</span><button data-inc="${esc(id)}" aria-label="Increase">+</button></div>
+      <div class="meta" style="text-align:right;margin-top:4px">${money(p.price * cart[id])}</div></div></div>`; }).join("")
+    : `<p class="empty">Your cart is empty</p>`;
+  $("bill").hidden = $("toCheckout").hidden = t.empty;
+  $("bill").innerHTML = billHTML(t);
+  $("miniBill").innerHTML = billHTML(t);
+  const low = !t.empty && t.subtotal < STORE_SETTINGS.minimumOrder;
+  $("minMsg").hidden = !low;
+  $("minMsg").textContent = `Minimum order is ${money(STORE_SETTINGS.minimumOrder)}. Add ${money(STORE_SETTINGS.minimumOrder - t.subtotal)} more to checkout.`;
+  $("toCheckout").disabled = low;
+}
+ 
+/* ---------- 6. DRAWER (cart / checkout / done) ---------- */
+function show(view) {
+  $("cartView").hidden = view !== "cart"; $("checkoutView").hidden = view !== "checkout"; $("doneView").hidden = view !== "done";
+  $("drawerTitle").textContent = view === "checkout" ? "Checkout" : view === "done" ? "Order placed" : "Your cart";
+}
+function openDrawer(view = "cart") { show(view); $("drawer").classList.add("on"); $("overlay").classList.add("on"); $("drawer").setAttribute("aria-hidden", "false"); }
+function closeDrawer() { $("drawer").classList.remove("on"); $("overlay").classList.remove("on"); $("drawer").setAttribute("aria-hidden", "true"); }
+ 
+/* ---------- 7. ORDER ID, EMAIL, PLACE ORDER ---------- */
+// Format RK-YYYYMMDD-NNNN. Used IDs are remembered so none repeats on this device.
+function makeOrderId() {
+  const d = new Date(), ymd = d.getFullYear() + String(d.getMonth() + 1).padStart(2, "0") + String(d.getDate()).padStart(2, "0");
+  let used = []; try { used = JSON.parse(localStorage.getItem("rkOrderIds")) || []; } catch (e) {}
+  let id;
+  do { id = `RK-${ymd}-${Math.floor(1000 + Math.random() * 9000)}`; } while (used.includes(id));
+  used.push(id); localStorage.setItem("rkOrderIds", JSON.stringify(used.slice(-500)));
+  return id;
+}
+ 
+function buildEmailBody(o) {
+  const items = o.items.map((it, i) => `Product ${i + 1}: ${it.name} (${it.unit})\nQuantity: ${it.qty}\nPrice: ${money(it.price)}\nTotal: ${money(it.price * it.qty)}`).join("\n\n");
+  return `NEW ORDER - RK STORE
+Order ID: ${o.id}
+Date & Time: ${o.date}
+ 
+CUSTOMER DETAILS
+Name: ${o.name}
+Mobile: ${o.mobile}
+Address: ${o.address}
+Landmark: ${o.landmark}
+PIN: ${o.pin}
+ 
+ORDER ITEMS
+${items}
+ 
+Subtotal: ${money(o.t.subtotal)}
+Delivery Charge: ${o.t.delivery ? money(o.t.delivery) : "FREE"}
+Discount (savings): ${money(o.t.discount)}
+FINAL TOTAL: ${money(o.t.total)}
+ 
+Payment Method: ${o.payment}
+Order Note: ${o.note || "-"}`;
+}
+ 
+async function sendOrderEmail(o) {
+  if (EMAIL_CONFIG.serviceId.startsWith("YOUR_") || EMAIL_CONFIG.templateId.startsWith("YOUR_") || EMAIL_CONFIG.publicKey.startsWith("YOUR_"))
+    throw new Error("EmailJS is not configured");
+  await emailjs.send(EMAIL_CONFIG.serviceId, EMAIL_CONFIG.templateId, {
+    to_email: EMAIL_CONFIG.ownerEmail,
+    subject: "New RK STORE Order - " + o.id,
+    order_id: o.id,
+    message: buildEmailBody(o)
+  }, { publicKey: EMAIL_CONFIG.publicKey });
+}
+ 
+async function placeOrder(e) {
+  e.preventDefault();
+  const f = e.target, v = n => f.elements[n].value.trim(), msg = $("formMsg");
+  const t = totals();
+  const fail = m => { msg.textContent = m; msg.hidden = false; };
+  msg.hidden = true;
+  f.querySelectorAll(".bad").forEach(x => x.classList.remove("bad"));
+  for (const n of ["name", "mobile", "address", "landmark", "pin"]) if (!v(n)) { f.elements[n].classList.add("bad"); return fail("Please fill all required fields."); }
+  if (!/^[6-9]\d{9}$/.test(v("mobile"))) { f.elements.mobile.classList.add("bad"); return fail("Enter a valid 10-digit mobile number."); }
+  if (!/^\d{6}$/.test(v("pin"))) { f.elements.pin.classList.add("bad"); return fail("Enter a valid 6-digit PIN code."); }
+  if (t.empty) return fail("Your cart is empty.");
+  if (t.subtotal < STORE_SETTINGS.minimumOrder) return fail(`Minimum order is ${money(STORE_SETTINGS.minimumOrder)}.`);
+ 
+  const order = {
+    id: makeOrderId(), date: new Date().toLocaleString("en-IN"), t,
+    name: v("name"), mobile: v("mobile"), address: v("address"), landmark: v("landmark"), pin: v("pin"), note: v("note"),
+    payment: f.elements.payment.value,
+    items: Object.keys(cart).map(id => { const p = find(id); return { name: p.name, unit: p.unit, price: p.price, qty: cart[id] }; })
+  };
+  $("placeBtn").disabled = true; $("placeBtn").textContent = "Placing order…";
+  try {
+    await sendOrderEmail(order);
+  } catch (err) {
+    console.error(err);
+    $("placeBtn").disabled = false; $("placeBtn").textContent = "Place order";
+    return fail(err.message === "EmailJS is not configured"
+      ? "Ordering is not set up yet (EmailJS keys missing). Please call 6901671015."
+      : "Could not send your order. Check your internet and try again, or call 6901671015.");
+  }
+  cart = {}; update(); f.reset(); f.elements.pin.value = "781124";
+  $("placeBtn").disabled = false; $("placeBtn").textContent = "Place order";
+  $("doneView").innerHTML = `<div style="font-size:3rem">✅</div><h3>Thank you, ${esc(order.name)}!</h3>
+    <p>Your order has been sent to RK STORE.</p><div class="oid">${order.id}</div>
+    <p>Total: <b>${money(t.total)}</b> · ${esc(order.payment)}</p>
+    <p class="meta" style="margin:10px 0">We will call ${esc(order.mobile)} to confirm delivery.</p>
+    <button class="primary" id="doneBtn">Continue shopping</button>`;
+  $("doneBtn").onclick = closeDrawer; show("done");
+}
+ 
+/* ---------- 8. EVENTS & STARTUP ---------- */
+document.addEventListener("click", e => {
+  const b = e.target.closest("button"); if (!b) return;
+  if (b.dataset.cat) { activeCat = b.dataset.cat; renderCats(); renderProducts(); }
+  else if (b.dataset.add) change(b.dataset.add, 1);
+  else if (b.dataset.inc) change(b.dataset.inc, 1);
+  else if (b.dataset.dec) change(b.dataset.dec, -1);
+  else if (b.dataset.rm) { delete cart[b.dataset.rm]; update(); }
+});
+$("search").addEventListener("input", e => { query = e.target.value; renderProducts(); });
+$("cartBtn").onclick = () => openDrawer("cart");
+$("closeBtn").onclick = $("overlay").onclick = closeDrawer;
+$("toCheckout").onclick = () => show("checkout");
+$("backBtn").onclick = () => show("cart");
+$("checkoutView").addEventListener("submit", placeOrder);
+$("checkoutView").addEventListener("change", () => {
+  const upi = $("checkoutView").elements.payment.value.startsWith("UPI");
+  $("upiNote").hidden = !upi || !STORE_SETTINGS.upiId;
+  $("upiNote").textContent = `Pay to UPI ID: ${STORE_SETTINGS.upiId} when your order arrives.`;
+});
+ 
+(async function init() {
+  renderCats();
+  try { products = await loadProductsFromURL(); }
+  catch (err) {
+    console.error(err);
+    $("status").textContent = "Could not load products (likely a CORS or link problem). Use a published Google Sheet CSV or a JSON URL that allows browser access.";
+    products = [];
+  }
+  update();
+})();
+ 
